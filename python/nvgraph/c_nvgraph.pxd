@@ -6,4 +6,7 @@ cdef extern from "nvgraph_gdf.h":
     cdef gdf_error gdf_sssp_nvgraph(gdf_graph *gdf_G,
                                     const int *source_vert,
                                     gdf_column *sssp_distances)
+    
+    cdef gdf_error gdf_triangle_count_nvgraph(gdf_graph *gdfG,
+                                              unsigned long long* result)
 
