@@ -275,9 +275,6 @@ gdf_error gdf_triangle_count_nvgraph(gdf_graph*gdf_G, unsigned long long* result
 	nvgraphGraphDescr_t nvgraph_G = nullptr;
 	NVG_TRY(nvgraphCreate(&nvg_handle));
 	GDF_TRY(gdf_createGraph_nvgraph(nvg_handle, gdf_G, &nvgraph_G, false));
-	std::cout << "Result ptr: " << result << "\n";
-	if (gdf_G->adjList->edge_data)
-		std::cout << "There is edge data on input graph\n";
 	NVG_TRY(nvgraphTriangleCount(nvg_handle, nvgraph_G, (uint64_t*)result));
 	NVG_TRY(nvgraphDestroyGraphDescr(nvg_handle, nvgraph_G));
 	NVG_TRY(nvgraphDestroy(nvg_handle));
