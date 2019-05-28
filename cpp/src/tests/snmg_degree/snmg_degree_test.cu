@@ -160,7 +160,7 @@ public:
           std::cout << "Call to gdf_snmg_degree failed: " << gdf_error_get_name(status) << "\n";
           std::cout << "Dtypes: " << col_off->dtype << "," << col_ind->dtype << "\n";
         }
-        ASSERT_EQ(status, 0);
+        EXPECT_EQ(status, 0);
 #pragma omp master
         {
           std::cout << "GPU time: " << omp_get_wtime() - t << "\n";
@@ -175,7 +175,7 @@ public:
                                   cudaMemcpyDeviceToHost));
 
           for (auto j = 0; j < degree_h.size(); ++j)
-            ASSERT_EQ(degree_ref[j], degree_h[j]);
+            EXPECT_EQ(degree_ref[j], degree_h[j]);
         }
 
         gdf_col_delete(col_off);
@@ -225,7 +225,7 @@ public:
           std::cout << "Call to gdf_snmg_degree failed: " << gdf_error_get_name(status) << "\n";
           std::cout << "Dtypes: " << col_off->dtype << "," << col_ind->dtype << "\n";
         }
-        ASSERT_EQ(status, 0);
+        EXPECT_EQ(status, 0);
 #pragma omp master
         {
           std::cout << "multi-GPU time: " << omp_get_wtime() - t << "\n";
@@ -240,7 +240,7 @@ public:
                                   cudaMemcpyDeviceToHost));
 
           for (auto j = 0; j < degree_h.size(); ++j)
-            ASSERT_EQ(degree_ref[j], degree_h[j]);
+            EXPECT_EQ(degree_ref[j], degree_h[j]);
         }
 
         gdf_col_delete(col_off);
