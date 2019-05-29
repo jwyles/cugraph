@@ -146,10 +146,9 @@ gdf_error treeReduce(SNMGinfo& env, size_t length, val_t* x_loc, val_t** x_glob)
                         op);
       cudaCheckError();
     }
+    sync_all();
     rank *= 2;
   }
-
-  sync_all();
 
   // Thread 0 copies it's local result into its global space
   if (i == 0) {
