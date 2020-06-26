@@ -245,6 +245,110 @@ vertex_t renumber_clusters(vertex_t graph_num_vertices,
 }
 
 template <typename vertex_t, typename edge_t, typename weight_t>
+void compute_delta_modularity(experimental::GraphCSRView<vertex_t, edge_t, weight_t> const &graph,
+                              rmm::device_vector<vertex_t>& cluster_hash,
+                              rmm::device_vector<weight_t>& cluster_hash_sum,
+                              rmm::device_vector<weight_t>& old_cluster_sum,
+                              vertex_t const *d_src_indices,
+                              vertex_t *d_cluster,
+                              weight_t *d_cluster_weights,
+                              weight_t m2,
+                              weight_t const *d_vertex_weights,
+                              weight_t *d_delta_Q,
+                              cudaStream_t stream) {
+  thrust::fill(cluster_hash.begin(), cluster_hash.end(), vertex_t{-1});
+  thrust::fill(cluster_hash_sum.begin(), cluster_hash_sum.end(), weight_t{0.0});
+  thrust::fill(old_cluster_sum.begin(), old_cluster_sum.end(), weight_t{0.0});
+
+  vertex_t *d_cluster_hash         = cluster_hash.data().get();
+  weight_t *d_cluster_hash_sum     = cluster_hash_sum.data().get();
+  weight_t *d_old_cluster_sum      = old_cluster_sum.data().get();
+
+  vertex_t *d_dst_indices          = graph.indices;
+  edge_t *d_offsets                = graph.offsets;
+  weight_t *d_weights              = graph.edge_data;
+
+  //
+  // For each source vertex, we're going to build a hash
+  // table to the destination cluster ids.  We can use
+  // the offsets ranges to define the bounds of the hash
+  // table.
+  //
+  thrust::for_each(rmm::exec_policy(stream)->on(stream),
+                   thrust::make_counting_iterator<edge_t>(0),
+                   thrust::make_counting_iterator<edge_t>(graph.number_of_edges),
+                   [d_src_indices,
+                    d_dst_indices,
+                    d_cluster,
+                    d_offsets,
+                    d_cluster_hash,
+                    d_cluster_hash_sum,
+                    d_weights,
+                    d_old_cluster_sum] __device__(edge_t loc) {
+                     vertex_t src = d_src_indices[loc];
+                     vertex_t dst = d_dst_indices[loc];
+
+                     if (src != dst) {
+                       vertex_t old_cluster = d_cluster[src];
+                       vertex_t new_cluster = d_cluster[dst];
+                       edge_t hash_base     = d_offsets[src];
+                       edge_t n_edges       = d_offsets[src + 1] - hash_base;
+
+                       int h         = (new_cluster % n_edges);
+                       edge_t offset = hash_base + h;
+                       while (d_cluster_hash[offset] != new_cluster) {
+                         if (d_cluster_hash[offset] == -1) {
+                           atomicCAS(d_cluster_hash + offset, -1, new_cluster);
+                         } else {
+                           h      = (h + 1) % n_edges;
+                           offset = hash_base + h;
+                         }
+                       }
+
+                       atomicAdd(d_cluster_hash_sum + offset, d_weights[loc]);
+
+                       if (old_cluster == new_cluster)
+                         atomicAdd(d_old_cluster_sum + src, d_weights[loc]);
+                     }
+                   });
+
+  thrust::for_each(rmm::exec_policy(stream)->on(stream),
+                   thrust::make_counting_iterator<edge_t>(0),
+                   thrust::make_counting_iterator<edge_t>(graph.number_of_edges),
+                   [m2,
+                    d_cluster_hash,
+                    d_src_indices,
+                    d_cluster,
+                    d_vertex_weights,
+                    d_delta_Q,
+                    d_cluster_hash_sum,
+                    d_old_cluster_sum,
+                    d_cluster_weights] __device__(edge_t loc) {
+                     vertex_t new_cluster = d_cluster_hash[loc];
+                     if (new_cluster >= 0) {
+                       vertex_t src         = d_src_indices[loc];
+                       vertex_t old_cluster = d_cluster[src];
+                       weight_t degc_totw   = d_vertex_weights[src] / m2;
+
+                       d_delta_Q[loc] =
+                         d_cluster_hash_sum[loc] - degc_totw * d_cluster_weights[new_cluster] -
+                         (d_old_cluster_sum[src] -
+                          (degc_totw * (d_cluster_weights[old_cluster] - d_vertex_weights[src])));
+
+#ifdef DEBUG
+                       printf("src = %d, new cluster = %d, d_delta_Q[%d] = %g\n",
+                              src,
+                              new_cluster,
+                              loc,
+                              d_delta_Q[loc]);
+#endif
+                     } else {
+                       d_delta_Q[loc] = weight_t{0.0};
+                     }
+                   });
+}
+
+template <typename vertex_t, typename edge_t, typename weight_t>
 weight_t update_clustering_by_delta_modularity(
   weight_t m2,
   experimental::GraphCSRView<vertex_t, edge_t, weight_t> const &graph,
@@ -264,9 +368,6 @@ weight_t update_clustering_by_delta_modularity(
   weight_t *d_cluster_hash_sum     = cluster_hash_sum.data().get();
   vertex_t *d_cluster              = cluster.data().get();
   vertex_t const *d_src_indices    = src_indices.data().get();
-  vertex_t *d_dst_indices          = graph.indices;
-  edge_t *d_offsets                = graph.offsets;
-  weight_t *d_weights              = graph.edge_data;
   weight_t const *d_vertex_weights = vertex_weights.data().get();
   weight_t *d_cluster_weights      = cluster_weights.data().get();
   weight_t *d_delta_Q              = delta_Q.data().get();
@@ -284,88 +385,17 @@ weight_t update_clustering_by_delta_modularity(
   while (new_Q > (cur_Q + 0.0001)) {
     cur_Q = new_Q;
 
-    thrust::fill(cluster_hash.begin(), cluster_hash.end(), vertex_t{-1});
-    thrust::fill(cluster_hash_sum.begin(), cluster_hash_sum.end(), weight_t{0.0});
-    thrust::fill(old_cluster_sum.begin(), old_cluster_sum.end(), weight_t{0.0});
-
-    //
-    // For each source vertex, we're going to build a hash
-    // table to the destination cluster ids.  We can use
-    // the offsets ranges to define the bounds of the hash
-    // table.
-    //
-    thrust::for_each(rmm::exec_policy(stream)->on(stream),
-                     thrust::make_counting_iterator<edge_t>(0),
-                     thrust::make_counting_iterator<edge_t>(graph.number_of_edges),
-                     [d_src_indices,
-                      d_dst_indices,
-                      d_cluster,
-                      d_offsets,
-                      d_cluster_hash,
-                      d_cluster_hash_sum,
-                      d_weights,
-                      d_old_cluster_sum] __device__(edge_t loc) {
-                       vertex_t src = d_src_indices[loc];
-                       vertex_t dst = d_dst_indices[loc];
-
-                       if (src != dst) {
-                         vertex_t old_cluster = d_cluster[src];
-                         vertex_t new_cluster = d_cluster[dst];
-                         edge_t hash_base     = d_offsets[src];
-                         edge_t n_edges       = d_offsets[src + 1] - hash_base;
-
-                         int h         = (new_cluster % n_edges);
-                         edge_t offset = hash_base + h;
-                         while (d_cluster_hash[offset] != new_cluster) {
-                           if (d_cluster_hash[offset] == -1) {
-                             atomicCAS(d_cluster_hash + offset, -1, new_cluster);
-                           } else {
-                             h      = (h + 1) % n_edges;
-                             offset = hash_base + h;
-                           }
-                         }
-
-                         atomicAdd(d_cluster_hash_sum + offset, d_weights[loc]);
-
-                         if (old_cluster == new_cluster)
-                           atomicAdd(d_old_cluster_sum + src, d_weights[loc]);
-                       }
-                     });
-
-    thrust::for_each(rmm::exec_policy(stream)->on(stream),
-                     thrust::make_counting_iterator<edge_t>(0),
-                     thrust::make_counting_iterator<edge_t>(graph.number_of_edges),
-                     [m2,
-                      d_cluster_hash,
-                      d_src_indices,
-                      d_cluster,
-                      d_vertex_weights,
-                      d_delta_Q,
-                      d_cluster_hash_sum,
-                      d_old_cluster_sum,
-                      d_cluster_weights] __device__(edge_t loc) {
-                       vertex_t new_cluster = d_cluster_hash[loc];
-                       if (new_cluster >= 0) {
-                         vertex_t src         = d_src_indices[loc];
-                         vertex_t old_cluster = d_cluster[src];
-                         weight_t degc_totw   = d_vertex_weights[src] / m2;
-
-                         d_delta_Q[loc] =
-                           d_cluster_hash_sum[loc] - degc_totw * d_cluster_weights[new_cluster] -
-                           (d_old_cluster_sum[src] -
-                            (degc_totw * (d_cluster_weights[old_cluster] - d_vertex_weights[src])));
-
-#ifdef DEBUG
-                         printf("src = %d, new cluster = %d, d_delta_Q[%d] = %g\n",
-                                src,
-                                new_cluster,
-                                loc,
-                                d_delta_Q[loc]);
-#endif
-                       } else {
-                         d_delta_Q[loc] = weight_t{0.0};
-                       }
-                     });
+    compute_delta_modularity(graph,
+                             cluster_hash,
+                             cluster_hash_sum,
+                             old_cluster_sum,
+                             d_src_indices,
+                             d_cluster,
+                             d_cluster_weights,
+                             m2,
+                             d_vertex_weights,
+                             d_delta_Q,
+                             stream);
 
     auto cluster_reduce_iterator =
       thrust::make_zip_iterator(thrust::make_tuple(d_cluster_hash, d_delta_Q));
