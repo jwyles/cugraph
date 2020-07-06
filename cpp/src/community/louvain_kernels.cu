@@ -17,7 +17,7 @@
 
 #include <rmm/thrust_rmm_allocator.h>
 
-#include <nvgraph/include/util.cuh>
+//#include <nvgraph/include/util.cuh>
 #include <utilities/cuda_utils.cuh>
 #include <utilities/graph_utils.cuh>
 
@@ -106,6 +106,18 @@ weight_t modularity(weight_t m2,
   return Q;
 }
 
+template float modularity(
+    float,
+    experimental::GraphCSRView<int32_t,int32_t,float>const&,
+    int32_t const*,
+    cudaStream_t);
+
+template double modularity(
+    double,
+    experimental::GraphCSRView<int32_t,int32_t,double>const&,
+    int32_t const*,
+    cudaStream_t);
+
 template <typename vertex_t, typename edge_t, typename weight_t>
 void generate_superverticies_graph(
   cugraph::experimental::GraphCSRView<vertex_t, edge_t, weight_t> &current_graph,
@@ -179,11 +191,26 @@ void generate_superverticies_graph(
   src_indices_v.resize(current_graph.number_of_edges);
 }
 
+template void generate_superverticies_graph(
+    cugraph::experimental::GraphCSRView<int32_t, int32_t, float>&,
+    rmm::device_vector<int32_t>&,
+    int32_t,
+    rmm::device_vector<int32_t>&,
+    cudaStream_t);
+
+template void generate_superverticies_graph(
+    cugraph::experimental::GraphCSRView<int32_t, int32_t, double>&,
+    rmm::device_vector<int32_t>&,
+    int32_t,
+    rmm::device_vector<int32_t>&,
+    cudaStream_t);
+
 template <typename vertex_t, typename edge_t, typename weight_t>
 void compute_vertex_sums(experimental::GraphCSRView<vertex_t, edge_t, weight_t> const &graph,
                          rmm::device_vector<weight_t> &sums,
                          cudaStream_t stream)
 {
+  int BLOCK_SIZE_1D = 64;
   dim3 block_size_1d =
     dim3((graph.number_of_vertices + BLOCK_SIZE_1D * 4 - 1) / BLOCK_SIZE_1D * 4, 1, 1);
   dim3 grid_size_1d = dim3(BLOCK_SIZE_1D * 4, 1, 1);
@@ -191,6 +218,14 @@ void compute_vertex_sums(experimental::GraphCSRView<vertex_t, edge_t, weight_t> 
   compute_vertex_sums<vertex_t, edge_t, weight_t><<<block_size_1d, grid_size_1d>>>(
     graph.number_of_vertices, graph.offsets, graph.edge_data, sums.data().get());
 }
+
+template void compute_vertex_sums(experimental::GraphCSRView<int32_t, int32_t, float> const&,
+                                  rmm::device_vector<float>&,
+                                  cudaStream_t);
+
+template void compute_vertex_sums(experimental::GraphCSRView<int32_t, int32_t, double> const&,
+                                  rmm::device_vector<double>&,
+                                  cudaStream_t);
 
 template <typename vertex_t>
 vertex_t renumber_clusters(vertex_t graph_num_vertices,
@@ -243,6 +278,13 @@ vertex_t renumber_clusters(vertex_t graph_num_vertices,
 
   return new_num_clusters;
 }
+
+template int32_t renumber_clusters(int32_t,
+                                   rmm::device_vector<int32_t>&,
+                                   rmm::device_vector<int32_t>&,
+                                   rmm::device_vector<int32_t>&,
+                                   int32_t*,
+                                   cudaStream_t);
 
 template <typename vertex_t, typename edge_t, typename weight_t>
 void compute_delta_modularity(experimental::GraphCSRView<vertex_t, edge_t, weight_t> const &graph,
@@ -347,6 +389,32 @@ void compute_delta_modularity(experimental::GraphCSRView<vertex_t, edge_t, weigh
                      }
                    });
 }
+
+template void compute_delta_modularity(
+    experimental::GraphCSRView<int32_t, int32_t, float> const &,
+    rmm::device_vector<int32_t>&,
+    rmm::device_vector<float>&,
+    rmm::device_vector<float>&,
+    int32_t const *,
+    int32_t *,
+    float *,
+    float,
+    float const *,
+    float *,
+    cudaStream_t);
+
+template void compute_delta_modularity(
+    experimental::GraphCSRView<int32_t, int32_t, double> const &,
+    rmm::device_vector<int32_t>&,
+    rmm::device_vector<double>&,
+    rmm::device_vector<double>&,
+    int32_t const *,
+    int32_t *,
+    double *,
+    double,
+    double const *,
+    double *,
+    cudaStream_t);
 
 template <typename vertex_t, typename edge_t, typename weight_t>
 weight_t update_clustering_by_delta_modularity(
@@ -472,6 +540,24 @@ weight_t update_clustering_by_delta_modularity(
 
   return cur_Q;
 }
+
+template float update_clustering_by_delta_modularity(
+    float,
+    experimental::GraphCSRView<int32_t, int32_t, float> const &,
+    rmm::device_vector<int32_t> const &,
+    rmm::device_vector<float> const &,
+    rmm::device_vector<float> &,
+    rmm::device_vector<int32_t>&,
+    cudaStream_t);
+
+template double update_clustering_by_delta_modularity(
+    double,
+    experimental::GraphCSRView<int32_t, int32_t, double> const &,
+    rmm::device_vector<int32_t> const &,
+    rmm::device_vector<double> const &,
+    rmm::device_vector<double> &,
+    rmm::device_vector<int32_t>&,
+    cudaStream_t);
 
 template <typename vertex_t, typename edge_t, typename weight_t>
 void louvain(experimental::GraphCSRView<vertex_t, edge_t, weight_t> const &graph,
