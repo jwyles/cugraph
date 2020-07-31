@@ -27,6 +27,12 @@ weight_t modularity(weight_t m2,
                     cudaStream_t stream);
 
 template <typename vertex_t, typename edge_t, typename weight_t>
+weight_t modularity2(weight_t m2,
+                     experimental::GraphCSRView<vertex_t, edge_t, weight_t> const &graph,
+                     vertex_t const *d_cluster,
+                     cudaStream_t stream);
+
+template <typename vertex_t, typename edge_t, typename weight_t>
 void generate_superverticies_graph(
     cugraph::experimental::GraphCSRView<vertex_t, edge_t, weight_t> &current_graph,
     rmm::device_vector<vertex_t> &src_indices_v,
@@ -46,6 +52,28 @@ vertex_t renumber_clusters(vertex_t graph_num_vertices,
                            rmm::device_vector<vertex_t> &cluster_inverse,
                            vertex_t *cluster_vec,
                            cudaStream_t stream);
+
+template<typename vertex_t, typename edge_t, typename weight_t>
+void assign_nodes(experimental::GraphCSRView<vertex_t, edge_t, weight_t> const& graph,
+                  weight_t* d_delta_Q,
+                  vertex_t* d_cluster_hash,
+                  vertex_t const* d_src_indices,
+                  vertex_t* d_next_cluster,
+                  weight_t const* d_vertex_weights,
+                  weight_t* d_cluster_weights,
+                  bool up_down,
+                  cudaStream_t stream);
+
+template<typename vertex_t, typename edge_t, typename weight_t>
+weight_t assign_single_node(experimental::GraphCSRView<vertex_t, edge_t, weight_t> const& graph,
+                            weight_t* d_delta_Q,
+                            vertex_t* d_cluster_hash,
+                            vertex_t const* d_src_indices,
+                            vertex_t* d_next_cluster,
+                            weight_t const* d_vertex_weights,
+                            weight_t* d_cluster_weights,
+                            bool up_down,
+                            cudaStream_t stream);
 
 template <typename vertex_t, typename edge_t, typename weight_t>
 void compute_delta_modularity(

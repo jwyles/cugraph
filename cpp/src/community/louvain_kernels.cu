@@ -26,6 +26,7 @@
 #endif
 
 #include <converters/COOtoCSR.cuh>
+#include <community/louvain_kernels.hpp>
 
 namespace cugraph {
 namespace detail {
@@ -117,6 +118,64 @@ template double modularity(
     experimental::GraphCSRView<int32_t,int32_t,double>const&,
     int32_t const*,
     cudaStream_t);
+
+template <typename vertex_t, typename edge_t, typename weight_t>
+weight_t modularity2(weight_t m2,
+                    experimental::GraphCSRView<vertex_t, edge_t, weight_t> const &graph,
+                    vertex_t const *d_cluster,
+                    cudaStream_t stream)
+{
+  vertex_t n_verts = graph.number_of_vertices;
+  vertex_t nnz = graph.number_of_edges;
+
+  rmm::device_vector<weight_t> scores(nnz);
+  rmm::device_vector<vertex_t> start_indices(nnz);
+  rmm::device_vector<weight_t> vertex_weights(n_verts);
+
+  weight_t* d_scores = scores.data().get();
+  vertex_t* d_start_indices = start_indices.data().get();
+  weight_t* d_vertex_weights = vertex_weights.data().get();
+
+  graph.get_source_indices(d_start_indices);
+  compute_vertex_sums<vertex_t, edge_t, weight_t>(graph, vertex_weights, stream);
+
+  thrust::for_each(rmm::exec_policy(stream)->on(stream),
+                   thrust::make_counting_iterator(0),
+                   thrust::make_counting_iterator(nnz),
+                   [d_scores, d_start_indices, d_vertex_weights, graph, d_cluster, m2]
+                    __device__ (edge_t i) {
+                      vertex_t start_id = d_start_indices[i];
+                      vertex_t end_id = graph.indices[i];
+                      weight_t weight = graph.edge_data[i];
+                      weight_t end_weight = d_vertex_weights[end_id];
+                      weight_t start_weight = d_vertex_weights[start_id];
+                      vertex_t start_cluster = d_cluster[start_id];
+                      vertex_t end_cluster = d_cluster[end_id];
+                      weight_t score = weight - (start_weight * end_weight) / m2;
+//                      if (start_id == end_id)
+//                        score *= 2;
+                      d_scores[i] = (end_cluster == start_cluster) ? score : 0.0; });
+
+  weight_t score = thrust::reduce(rmm::exec_policy(stream)->on(stream),
+                                  scores.begin(),
+                                  scores.end());
+  score /= m2;
+
+  return score;
+}
+
+template float modularity2(
+    float,
+    experimental::GraphCSRView<int32_t,int32_t,float>const&,
+    int32_t const*,
+    cudaStream_t);
+
+template double modularity2(
+    double,
+    experimental::GraphCSRView<int32_t,int32_t,double>const&,
+    int32_t const*,
+    cudaStream_t);
+
 
 template <typename vertex_t, typename edge_t, typename weight_t>
 void generate_superverticies_graph(
@@ -286,6 +345,175 @@ template int32_t renumber_clusters(int32_t,
                                    int32_t*,
                                    cudaStream_t);
 
+template<typename vertex_t, typename edge_t, typename weight_t>
+void assign_nodes(experimental::GraphCSRView<vertex_t, edge_t, weight_t> const &graph,
+                  weight_t* d_delta_Q,
+                  vertex_t* d_cluster_hash,
+                  vertex_t const* d_src_indices,
+                  vertex_t* d_next_cluster,
+                  weight_t const* d_vertex_weights,
+                  weight_t* d_cluster_weights,
+                  bool up_down,
+                  cudaStream_t stream) {
+  auto cluster_reduce_iterator =
+      thrust::make_zip_iterator(thrust::make_tuple(d_cluster_hash, d_delta_Q));
+
+  rmm::device_vector < vertex_t > temp_vertices(graph.number_of_vertices);
+  rmm::device_vector < vertex_t > temp_cluster(graph.number_of_vertices, vertex_t { -1 });
+  rmm::device_vector < weight_t > temp_delta_Q(graph.number_of_vertices, weight_t { 0.0 });
+
+  auto output_edge_iterator2 =
+      thrust::make_zip_iterator(thrust::make_tuple(temp_cluster.data().get(),
+                                                   temp_delta_Q.data().get()));
+
+  auto cluster_reduce_end =
+  thrust::reduce_by_key(rmm::exec_policy(stream)->on(stream),
+      d_src_indices,
+      d_src_indices + graph.number_of_edges,
+      cluster_reduce_iterator,
+      temp_vertices.data().get(),
+      output_edge_iterator2,
+      thrust::equal_to<vertex_t>(),
+      [] __device__(auto pair1, auto pair2) {
+        if (thrust::get<1>(pair1) > thrust::get<1>(pair2))
+        return pair1;
+        else
+        return pair2;
+      });
+
+  vertex_t final_size = thrust::distance(temp_vertices.data().get(), cluster_reduce_end.first);
+
+  vertex_t *d_temp_vertices = temp_vertices.data().get();
+  vertex_t *d_temp_clusters = temp_cluster.data().get();
+  weight_t *d_temp_delta_Q = temp_delta_Q.data().get();
+
+thrust::for_each(rmm::exec_policy(stream)->on(stream),
+    thrust::make_counting_iterator<vertex_t>(0),
+    thrust::make_counting_iterator<vertex_t>(final_size),
+    [d_temp_delta_Q,
+    up_down,
+    d_next_cluster,
+    d_temp_vertices,
+    d_vertex_weights,
+    d_temp_clusters,
+    d_cluster_weights] __device__(vertex_t id) {
+      if ((d_temp_clusters[id] >= 0) && (d_temp_delta_Q[id] > weight_t {0.0})) {
+        vertex_t new_cluster = d_temp_clusters[id];
+        vertex_t old_cluster = d_next_cluster[d_temp_vertices[id]];
+
+        if ((new_cluster > old_cluster) == up_down) {
+#ifdef DEBUG
+          printf(
+              "%s moving vertex %d from cluster %d to cluster %d - deltaQ = %g\n",
+              (up_down ? "up" : "down"),
+              d_temp_vertices[id],
+              d_next_cluster[d_temp_vertices[id]],
+              d_temp_clusters[id],
+              d_temp_delta_Q[id]);
+#endif
+
+          weight_t src_weight = d_vertex_weights[d_temp_vertices[id]];
+          d_next_cluster[d_temp_vertices[id]] = d_temp_clusters[id];
+
+          atomicAdd(d_cluster_weights + new_cluster, src_weight);
+          atomicAdd(d_cluster_weights + old_cluster, -src_weight);
+        }
+      }
+    });
+}
+
+template void assign_nodes(experimental::GraphCSRView<int32_t, int32_t, float> const&,
+                           float*,
+                           int32_t*,
+                           int32_t const*,
+                           int32_t*,
+                           float const*,
+                           float*,
+                           bool,
+                           cudaStream_t);
+
+template void assign_nodes(experimental::GraphCSRView<int32_t, int32_t, double> const&,
+                           double*,
+                           int32_t*,
+                           int32_t const*,
+                           int32_t*,
+                           double const *,
+                           double*,
+                           bool,
+                           cudaStream_t);
+
+template<typename vertex_t, typename edge_t, typename weight_t>
+weight_t assign_single_node(experimental::GraphCSRView<vertex_t, edge_t, weight_t> const &graph,
+                        weight_t* d_delta_Q,
+                        vertex_t* d_cluster_hash,
+                        vertex_t const* d_src_indices,
+                        vertex_t* d_next_cluster,
+                        weight_t const* d_vertex_weights,
+                        weight_t* d_cluster_weights,
+                        bool up_down,
+                        cudaStream_t stream) {
+  rmm::device_vector<vertex_t> new_cluster(graph.number_of_edges);
+  vertex_t* d_new_cluster = new_cluster.data().get();
+  vertex_t const* d_indices = graph.indices;
+
+  thrust::for_each(rmm::exec_policy(stream)->on(stream),
+                   thrust::make_counting_iterator(0),
+                   thrust::make_counting_iterator(graph.number_of_edges),
+                   [d_new_cluster, d_indices, d_next_cluster] __device__ (vertex_t i) {
+                      d_new_cluster[i] = d_next_cluster[d_indices[i]];});
+
+  auto reduce_iterator = thrust::make_zip_iterator(thrust::make_tuple(d_delta_Q,
+                                                                      d_src_indices,
+                                                                      d_new_cluster));
+
+  auto result = thrust::reduce(rmm::exec_policy(stream)->on(stream),
+                               reduce_iterator,
+                               reduce_iterator + graph.number_of_edges,
+                               thrust::make_tuple<weight_t, vertex_t, vertex_t>(-1.0, -1, -1),
+                               [] __device__ (thrust::tuple<weight_t, vertex_t, vertex_t> triple1, thrust::tuple<weight_t, vertex_t, vertex_t> triple2) {
+                                   if (thrust::get<0>(triple1) > thrust::get<0>(triple2))
+                                     return triple1;
+                                   else
+                                     return triple2;});
+
+  std::cout << "Found best swap: node " << thrust::get<1>(result) << ", to cluster "
+      << thrust::get<2>(result) << ", with score of " << thrust::get<0>(result) << "\n";
+
+  thrust::for_each(thrust::make_counting_iterator(0),
+                   thrust::make_counting_iterator(1),
+                   [d_next_cluster, result, d_vertex_weights, d_cluster_weights]
+                    __device__ (vertex_t id) {
+                      vertex_t node = thrust::get<1>(result);
+                      vertex_t new_cluster = thrust::get<2>(result);
+                      vertex_t old_cluster = d_next_cluster[node];
+                      d_next_cluster[node] = new_cluster;
+                      weight_t src_weight = d_vertex_weights[node];
+                      d_cluster_weights[new_cluster] += src_weight;
+                      d_cluster_weights[old_cluster] -= src_weight;});
+
+  return thrust::get<0>(result);
+}
+
+template float assign_single_node(experimental::GraphCSRView<int32_t, int32_t, float> const&,
+                                 float*,
+                                 int32_t*,
+                                 int32_t const*,
+                                 int32_t*,
+                                 float const*,
+                                 float*,
+                                 bool,
+                                 cudaStream_t);
+
+template double assign_single_node(experimental::GraphCSRView<int32_t, int32_t, double> const&,
+                                 double*,
+                                 int32_t*,
+                                 int32_t const*,
+                                 int32_t*,
+                                 double const *,
+                                 double*,
+                                 bool,
+                                 cudaStream_t);
+
 template <typename vertex_t, typename edge_t, typename weight_t>
 void compute_delta_modularity(experimental::GraphCSRView<vertex_t, edge_t, weight_t> const &graph,
                               rmm::device_vector<vertex_t>& cluster_hash,
@@ -440,6 +668,7 @@ weight_t update_clustering_by_delta_modularity(
   weight_t *d_cluster_weights      = cluster_weights.data().get();
   weight_t *d_delta_Q              = delta_Q.data().get();
   weight_t *d_old_cluster_sum      = old_cluster_sum.data().get();
+  vertex_t *d_next_cluster = next_cluster.data().get();
 
   weight_t new_Q = modularity<vertex_t, edge_t, weight_t>(m2, graph, cluster.data().get(), stream);
 
@@ -465,71 +694,15 @@ weight_t update_clustering_by_delta_modularity(
                              d_delta_Q,
                              stream);
 
-    auto cluster_reduce_iterator =
-      thrust::make_zip_iterator(thrust::make_tuple(d_cluster_hash, d_delta_Q));
-
-    rmm::device_vector<vertex_t> temp_vertices(graph.number_of_vertices);
-    rmm::device_vector<vertex_t> temp_cluster(graph.number_of_vertices, vertex_t{-1});
-    rmm::device_vector<weight_t> temp_delta_Q(graph.number_of_vertices, weight_t{0.0});
-
-    auto output_edge_iterator2 = thrust::make_zip_iterator(
-      thrust::make_tuple(temp_cluster.data().get(), temp_delta_Q.data().get()));
-
-    auto cluster_reduce_end =
-      thrust::reduce_by_key(rmm::exec_policy(stream)->on(stream),
-                            d_src_indices,
-                            d_src_indices + graph.number_of_edges,
-                            cluster_reduce_iterator,
-                            temp_vertices.data().get(),
-                            output_edge_iterator2,
-                            thrust::equal_to<vertex_t>(),
-                            [] __device__(auto pair1, auto pair2) {
-                              if (thrust::get<1>(pair1) > thrust::get<1>(pair2))
-                                return pair1;
-                              else
-                                return pair2;
-                            });
-
-    vertex_t final_size = thrust::distance(temp_vertices.data().get(), cluster_reduce_end.first);
-
-    vertex_t *d_temp_vertices = temp_vertices.data().get();
-    vertex_t *d_temp_clusters = temp_cluster.data().get();
-    vertex_t *d_next_cluster  = next_cluster.data().get();
-    weight_t *d_temp_delta_Q  = temp_delta_Q.data().get();
-
-    thrust::for_each(rmm::exec_policy(stream)->on(stream),
-                     thrust::make_counting_iterator<vertex_t>(0),
-                     thrust::make_counting_iterator<vertex_t>(final_size),
-                     [d_temp_delta_Q,
-                      up_down,
-                      d_next_cluster,
-                      d_temp_vertices,
-                      d_vertex_weights,
-                      d_temp_clusters,
-                      d_cluster_weights] __device__(vertex_t id) {
-                       if ((d_temp_clusters[id] >= 0) && (d_temp_delta_Q[id] > weight_t{0.0})) {
-                         vertex_t new_cluster = d_temp_clusters[id];
-                         vertex_t old_cluster = d_next_cluster[d_temp_vertices[id]];
-
-                         if ((new_cluster > old_cluster) == up_down) {
-#ifdef DEBUG
-                           printf(
-                             "%s moving vertex %d from cluster %d to cluster %d - deltaQ = %g\n",
-                             (up_down ? "up" : "down"),
-                             d_temp_vertices[id],
-                             d_next_cluster[d_temp_vertices[id]],
-                             d_temp_clusters[id],
-                             d_temp_delta_Q[id]);
-#endif
-
-                           weight_t src_weight = d_vertex_weights[d_temp_vertices[id]];
-                           d_next_cluster[d_temp_vertices[id]] = d_temp_clusters[id];
-
-                           atomicAdd(d_cluster_weights + new_cluster, src_weight);
-                           atomicAdd(d_cluster_weights + old_cluster, -src_weight);
-                         }
-                       }
-                     });
+    assign_nodes(graph,
+                 d_delta_Q,
+                 d_cluster_hash,
+                 d_src_indices,
+                 d_next_cluster,
+                 d_vertex_weights,
+                 d_cluster_weights,
+                 up_down,
+                 stream);
 
     up_down = !up_down;
 
@@ -618,7 +791,7 @@ void louvain(experimental::GraphCSRView<vertex_t, edge_t, weight_t> const &graph
 
   current_graph.get_source_indices(src_indices_v.data().get());
 
-  while (true) {
+  for (int i = 0; i < max_iter; i++) {
     //
     //  Sum the weights of all edges departing a vertex.  This is
     //  loop invariant, so we'll compute it here.
@@ -646,7 +819,10 @@ void louvain(experimental::GraphCSRView<vertex_t, edge_t, weight_t> const &graph
     hr_timer.stop();
 #endif
 
-    if (new_Q <= best_modularity) { break; }
+    if (new_Q <= best_modularity) {
+      *num_level = i;
+      break;
+    }
 
     best_modularity = new_Q;
 
@@ -668,6 +844,7 @@ void louvain(experimental::GraphCSRView<vertex_t, edge_t, weight_t> const &graph
 #ifdef TIMING
     hr_timer.stop();
 #endif
+    *num_level = i;
   }
 
 #ifdef TIMING
