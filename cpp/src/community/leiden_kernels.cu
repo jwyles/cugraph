@@ -70,17 +70,29 @@ weight_t update_clustering_by_delta_modularity_constrained(
   while (true) {
     cur_Q = new_Q;
 
-    compute_delta_modularity(graph,
-                             cluster_hash,
-                             cluster_hash_sum,
-                             old_cluster_sum,
-                             d_src_indices,
-                             d_cluster,
-                             d_cluster_weights,
-                             m2,
-                             d_vertex_weights,
-                             d_delta_Q,
-                             stream);
+    compute_delta_modularity3(m2,
+                              (weight_t)1.0,
+                              graph,
+                              src_indices,
+                              vertex_weights,
+                              cluster_weights,
+                              cluster,
+                              cluster_hash,
+                              delta_Q,
+                              old_cluster_sum,
+                              stream);
+
+//    compute_delta_modularity(graph,
+//                             cluster_hash,
+//                             cluster_hash_sum,
+//                             old_cluster_sum,
+//                             d_src_indices,
+//                             d_cluster,
+//                             d_cluster_weights,
+//                             m2,
+//                             d_vertex_weights,
+//                             d_delta_Q,
+//                             stream);
 
 //    compute_delta_modularity2(graph,
 //                            d_cluster,
@@ -114,7 +126,7 @@ weight_t update_clustering_by_delta_modularity_constrained(
                         vertex_t current_cluster = d_cluster[start];
                         vertex_t new_cluster = d_cluster[end];
                         if (current_cluster == new_cluster && d_delta_Q[i] > 0) {
-                          printf("Vertex %d moving from %d to %d with score %f\n", start, current_cluster, new_cluster, d_delta_Q[i]);
+//                          printf("Vertex %d moving from %d to %d with score %f\n", start, current_cluster, new_cluster, d_delta_Q[i]);
                           d_delta_Q[i] = 0;
                         }});
 
@@ -148,10 +160,10 @@ weight_t update_clustering_by_delta_modularity_constrained(
     up_down = !up_down;
 
     new_Q = modularity<vertex_t, edge_t, weight_t>(m2, graph, next_cluster.data().get(), stream);
-    auto new_Q2 = modularity2<vertex_t, edge_t, weight_t>(m2, graph, next_cluster.data().get(), stream);
-    auto Q_diff = abs(new_Q - new_Q2);
-    if (Q_diff > .000001)
-      std::cout << "Difference in modularity scores of " << Q_diff << " new score " << new_Q2 << " old score " << new_Q << "\n";
+//    auto new_Q2 = modularity2<vertex_t, edge_t, weight_t>(m2, graph, next_cluster.data().get(), stream);
+//    auto Q_diff = abs(new_Q - new_Q2);
+//    if (Q_diff > .000001)
+//      std::cout << "Difference in modularity scores of " << Q_diff << " new score " << new_Q2 << " old score " << new_Q << "\n";
 
 
     weight_t actual_delta = new_Q - cur_Q;

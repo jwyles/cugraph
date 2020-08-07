@@ -90,6 +90,19 @@ void compute_delta_modularity(
     cudaStream_t stream);
 
 template <typename vertex_t, typename edge_t, typename weight_t>
+void compute_delta_modularity3(weight_t total_edge_weight,
+                              weight_t resolution,
+                              experimental::GraphCSRView<vertex_t, edge_t, weight_t> const &graph,
+                              rmm::device_vector<vertex_t> const &src_indices_v,
+                              rmm::device_vector<weight_t> const &vertex_weights_v,
+                              rmm::device_vector<weight_t> const &cluster_weights_v,
+                              rmm::device_vector<vertex_t> const &cluster_v,
+                              rmm::device_vector<vertex_t> &cluster_hash_v,
+                              rmm::device_vector<weight_t> &delta_Q_v,
+                              rmm::device_vector<weight_t> &tmp_size_V_v,
+                              cudaStream_t stream);
+
+template <typename vertex_t, typename edge_t, typename weight_t>
 weight_t update_clustering_by_delta_modularity(
     weight_t m2,
     experimental::GraphCSRView<vertex_t, edge_t, weight_t> const &graph,
